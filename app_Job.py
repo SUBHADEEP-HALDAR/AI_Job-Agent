@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from modules import job_data, job_matcher
+from modules import job_data, job_matcher, job_sources
 from modules import resume_parser as rp
 from modules import skills as sk
 
@@ -29,6 +29,24 @@ def _public_mode() -> bool:
 
 
 PUBLIC = _public_mode()
+MAX_LIVE_SEARCHES = 15  # per browser session, to protect the shared API key
+ADZUNA_LOGO = Path(__file__).parent / "assets" / "adzuna.png"
+
+
+def _secret(name: str) -> str:
+    """Read a setting from Streamlit secrets or an environment variable."""
+    value = os.getenv(name, "")
+    try:
+        value = st.secrets.get(name, value)
+    except Exception:  # no secrets file locally
+        pass
+    return str(value or "").strip()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Fetching live jobs…")
+def fetch_live_jobs(what: str, where: str, country: str, app_id: str, app_key: str) -> list:
+    """Cached for 6 hours so repeated identical searches don't use up API quota."""
+    return job_sources.search_adzuna(app_id, app_key, what, where, country)
 
 st.set_page_config(page_title="AI Job Finder", page_icon="🔎", layout="wide")
 
@@ -183,14 +201,50 @@ if profile:
 
     # ---- Step 4: results --------------------------------------------------
     st.header("4. Matching jobs")
-    jobs, report = job_data.clean_jobs(job_data.load_all_jobs(), today=date.today())
-    if st.button("Find matching jobs", type="primary"):
-        st.session_state.results = job_matcher.rank_jobs(profile, prefs, jobs, today=date.today())
+    app_id, app_key = _secret("ADZUNA_APP_ID"), _secret("ADZUNA_APP_KEY")
+    country = (_secret("ADZUNA_COUNTRY") or "in").lower()
+    live_ready = bool(app_id and app_key)
+    sources = (["Live jobs (Adzuna)"] if live_ready else []) + ["Sample jobs (fictional)"]
+    source = st.radio("Job source", sources, horizontal=True)
+    use_live = source.startswith("Live")
+    if not live_ready:
+        st.info("Live jobs are off because no Adzuna API keys are set. "
+                "See 'Live jobs' in the README. Until then only fictional sample jobs are shown.")
+    else:
+        st.caption("Live search sends only your role and location keywords to Adzuna. "
+                   "Your resume and profile are never sent.")
 
-    with st.expander(f"Job data quality: {report['kept']} of {report['loaded']} records usable"):
-        st.write({k: (v if not isinstance(v, list) else (v or "none")) for k, v in report.items()})
-        st.caption("Sample jobs are fictional and dated for testing. Add your own real "
-                   "listings from the sidebar, or refresh the dates in data/sample_jobs.json.")
+    if st.button("Find matching jobs", type="primary"):
+        live_jobs, error = [], None
+        if use_live:
+            if st.session_state.get("live_calls", 0) >= MAX_LIVE_SEARCHES:
+                error = "Live search limit reached for this session. Reload the page to continue."
+            else:
+                st.session_state.live_calls = st.session_state.get("live_calls", 0) + 1
+                what, where = job_sources.build_query(prefs, profile)
+                try:
+                    live_jobs = fetch_live_jobs(what, where, country, app_id, app_key)
+                except job_sources.JobSourceError as e:
+                    error = str(e)
+        if error:
+            st.error(error)
+            st.session_state.pop("results", None)
+        else:
+            jobs, report = job_data.clean_jobs(
+                live_jobs + job_data.load_all_jobs(include_sample=not use_live),
+                today=date.today())
+            st.session_state.results = job_matcher.rank_jobs(profile, prefs, jobs, today=date.today())
+            st.session_state.report = report
+            st.session_state.result_country = country
+            if use_live and not live_jobs:
+                st.warning("Adzuna returned no jobs for that search. Try a broader role or location.")
+
+    report = st.session_state.get("report")
+    if report:
+        with st.expander(f"Job data quality: {report['kept']} of {report['loaded']} records usable"):
+            st.write({k: (v if not isinstance(v, list) else (v or "none")) for k, v in report.items()})
+            st.caption("Sample jobs are fictional and dated for testing. Live jobs come from Adzuna, "
+                       "with skills and experience level inferred from short listing snippets.")
 
     results = st.session_state.get("results")
     if results is not None:
@@ -231,6 +285,11 @@ if profile:
                     st.caption("No valid application link on this record.")
                 if job.get("fictional"):
                     st.caption("⚠ Sample listing (fictional) for testing.")
+                if job.get("live"):
+                    site = job_sources.attribution_url(st.session_state.get("result_country", "in"))
+                    if ADZUNA_LOGO.exists():
+                        st.image(str(ADZUNA_LOGO), width=116)
+                    st.caption(f"Jobs by [Adzuna]({site})")
                 with st.expander("Score breakdown"):
                     st.dataframe(pd.DataFrame([
                         {"Factor": job_matcher.BREAKDOWN_LABELS[k], "Points": pts,
